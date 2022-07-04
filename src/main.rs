@@ -1,6 +1,8 @@
 use std::thread;
+use std::error::Error;
 use std::io::{BufRead, BufReader};
 use std::process::{ChildStdout, Command, Stdio};
+use aws_sdk_cloudwatchlogs::Client;
 
 use structopt::StructOpt;
 
@@ -8,23 +10,31 @@ use cli::Cli;
 
 mod cli;
 
-fn main() -> Result<(), ()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::from_args();
 
-    let log_groups = list_log_groups();
+    let log_groups = list_log_groups().await?;
     println!("Watching the following log groups : {}", log_groups.join(", "));
 
     let processes = log_groups
         .into_iter()
         .map(|log_group| {
             thread::spawn(move || {
+                println!("watching {}", log_group);
 
-                watch_log_group(&log_group)
-                    .lines()
-                    .filter_map(|line| line.ok())
-                    .for_each(|line| println!("{} : {}", log_group, line));
+                match watch_log_group(&log_group) {
+                    Some(buffer) => {
+                        buffer
+                            .lines()
+                            .filter_map(|line| line.ok())
+                            .for_each(|line| println!("{} : {}", log_group, line))
+                    }
+                    None => ()
+                }
             })
         });
+    println!("after processes");
 
     let failures =  processes
         .map(|p| p.join())
@@ -40,32 +50,36 @@ fn main() -> Result<(), ()> {
     }
     else {
         failures.iter().for_each(|f| eprintln!("{:?}", f));
-        Err(())
+        panic!("Failure")
     }
 }
 
-fn list_log_groups() -> Vec<String> {
-    let output = Command::new("saw")
-        .arg("groups")
-        .output()
-        .unwrap();
+async fn list_log_groups() -> Result<Vec<String>, Box<dyn Error>> {
+    let shared_config = aws_config::load_from_env().await;
+    let client = Client::new(&shared_config);
+    let req = client.describe_log_groups();
+    let resp = req.send().await?;
 
-    let stdout: String = String::from_utf8(output.stdout).unwrap();
-    stdout.lines()
-        .map(|l| l.to_string())
-        .collect()
+    // TODO : handle pagination
+    let groups = resp.log_groups.unwrap_or(Vec::new())
+        .into_iter()
+        .filter_map(|lg| lg.log_group_name)
+        .collect();
+
+    Ok(groups)
 }
 
-fn watch_log_group(log_group: &str) -> BufReader<ChildStdout> {
-    let out = Command::new("saw")
-        .arg("watch")
+fn watch_log_group(log_group: &str) -> Option<BufReader<ChildStdout>> {
+    let out = Command::new("tail")
+        .arg("-f")
+        .arg("-n")
+        .arg("-10")
         .arg(log_group)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .spawn()
         .expect("Stream failed")
-        .stdout
-        .expect("Stdout None");
+        .stdout?;
 
-    BufReader::new(out)
+    Some(BufReader::new(out))
 }
 
